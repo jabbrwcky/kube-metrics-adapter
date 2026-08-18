@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/api"
 	promv1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	promconfig "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
+	"github.com/sirupsen/logrus"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -35,8 +37,19 @@ func (r NoResultError) Error() string {
 	return fmt.Sprintf("query '%s' did not result a valid response", r.query)
 }
 
+// AmbiguousResultError is returned when a query yields more than one series, in
+// which case the value used would depend on the order Prometheus returned them.
+type AmbiguousResultError struct {
+	query   string
+	samples int
+}
+
+func (r AmbiguousResultError) Error() string {
+	return fmt.Sprintf("query '%s' returned %d samples, expected exactly one", r.query, r.samples)
+}
+
 type PrometheusCollectorPlugin struct {
-	promAPI           promv1.API
+	promAPI            promv1.API
 	client             kubernetes.Interface
 	additionalPromAPIs map[string]promv1.API
 }
@@ -173,10 +186,13 @@ func NewPrometheusCollector(client kubernetes.Interface, promAPI promv1.API, add
 }
 
 func (c *PrometheusCollector) GetMetrics(ctx context.Context) ([]CollectedMetric, error) {
-	// TODO: use real context
-	value, _, err := c.promAPI.Query(ctx, c.query, time.Now().UTC())
+	value, warnings, err := c.promAPI.Query(ctx, c.query, time.Now().UTC())
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("promQL query '%s' failed: %w", c.query, err)
+	}
+
+	if len(warnings) > 0 {
+		logrus.WithField("query", c.query).Warnf("prometheus query returned warnings: %s", strings.Join(warnings, "; "))
 	}
 
 	var sampleValue model.SampleValue
@@ -187,10 +203,20 @@ func (c *PrometheusCollector) GetMetrics(ctx context.Context) ([]CollectedMetric
 			return nil, &NoResultError{query: c.query}
 		}
 
+		if len(samples) > 1 {
+			return nil, &AmbiguousResultError{query: c.query, samples: len(samples)}
+		}
+
 		sampleValue = samples[0].Value
 	case model.ValScalar:
 		scalar := value.(*model.Scalar)
 		sampleValue = scalar.Value
+	case model.ValNone, model.ValMatrix, model.ValString:
+		logrus.WithFields(logrus.Fields{
+			"query":      c.query,
+			"resultType": value.Type().String(),
+		}).Error("unsupported prometheus result type")
+		return nil, &NoResultError{query: c.query}
 	}
 
 	if math.IsNaN(float64(sampleValue)) {

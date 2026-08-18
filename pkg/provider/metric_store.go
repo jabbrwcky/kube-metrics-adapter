@@ -30,6 +30,13 @@ type externalMetricsStoredMetric struct {
 	TTL   time.Time
 }
 
+// expired reports whether a stored metric's TTL has passed. Read paths use this
+// so metrics stop being served the moment they go stale, rather than lingering
+// until the next garbage collection run.
+func expired(ttl time.Time) bool {
+	return ttl.Before(time.Now().UTC())
+}
+
 // MetricStore is a simple in-memory Metrics Store for HPA metrics.
 type MetricStore struct {
 	// metricName -> referencedResource -> objectNamespace -> objectName -> metric
@@ -273,7 +280,10 @@ func (s *MetricStore) GetMetricsBySelector(_ context.Context, namespace objectNa
 		for _, object2labels := range namespace2object {
 			for _, labels2metric := range object2labels {
 				for _, metric := range labels2metric {
-					if selector.Matches(labels.Set(metric.Value.Metric.Selector.MatchLabels)) {
+					if expired(metric.TTL) {
+						continue
+					}
+					if metric.Value.Metric.Selector != nil && selector.Matches(labels.Set(metric.Value.Metric.Selector.MatchLabels)) {
 						matchedMetrics = append(matchedMetrics, metric.Value)
 					}
 				}
@@ -282,6 +292,9 @@ func (s *MetricStore) GetMetricsBySelector(_ context.Context, namespace objectNa
 	} else if object2labels, ok := namespace2object[namespace]; ok {
 		for _, labels2hash := range object2labels {
 			for _, metric := range labels2hash {
+				if expired(metric.TTL) {
+					continue
+				}
 				if metric.Value.Metric.Selector != nil && selector.Matches(labels.Set(metric.Value.Metric.Selector.MatchLabels)) {
 					matchedMetrics = append(matchedMetrics, metric.Value)
 				}
@@ -317,6 +330,9 @@ func (s *MetricStore) GetMetricsByName(_ context.Context, object types.Namespace
 		for _, object2label := range namespace2object {
 			if label2metric, ok := object2label[objectName(namespace)]; ok {
 				for metric, value := range label2metric {
+					if expired(value.TTL) {
+						continue
+					}
 					if selector.Matches(parseHashLabelMap(metric)) {
 						return &value.Value
 					}
@@ -326,6 +342,9 @@ func (s *MetricStore) GetMetricsByName(_ context.Context, object types.Namespace
 	} else if object2label, ok := namespace2object[namespace]; ok {
 		if label2metric, ok := object2label[name]; ok {
 			for metric, value := range label2metric {
+				if expired(value.TTL) {
+					continue
+				}
 				if selector.Matches(parseHashLabelMap(metric)) {
 					return &value.Value
 				}
@@ -370,6 +389,9 @@ func (s *MetricStore) GetExternalMetric(_ context.Context, namespace objectNames
 	if metrics, ok := s.externalMetricsStore[namespace]; ok {
 		if selectors, ok := metrics[metricName(info.Metric)]; ok {
 			for _, sel := range selectors {
+				if expired(sel.TTL) {
+					continue
+				}
 				if selector.Matches(labels.Set(sel.Value.MetricLabels)) {
 					matchedMetrics = append(matchedMetrics, sel.Value)
 				}
@@ -410,7 +432,7 @@ func (s *MetricStore) RemoveExpired() {
 			for namespace, object2label := range namespace2object {
 				for object, label2metric := range object2label {
 					for labelsHash, metric := range label2metric {
-						if metric.TTL.Before(time.Now().UTC()) {
+						if expired(metric.TTL) {
 							delete(label2metric, labelsHash)
 						}
 					}
@@ -435,7 +457,7 @@ func (s *MetricStore) RemoveExpired() {
 	for namespace, metrics := range s.externalMetricsStore {
 		for metricName, selectors := range metrics {
 			for k, metric := range selectors {
-				if metric.TTL.Before(time.Now().UTC()) {
+				if expired(metric.TTL) {
 					delete(selectors, k)
 				}
 			}
