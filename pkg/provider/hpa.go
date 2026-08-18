@@ -143,24 +143,35 @@ func (p *HPAProvider) updateHPAs() error {
 			Namespace: hpa.Namespace,
 		}
 
+		ll := p.logger.WithFields(
+			log.Fields{
+				"namespace": resourceRef.Namespace,
+				"name":      resourceRef.Name,
+			})
+
 		cachedHPA, ok := p.hpaCache[resourceRef]
 		hpaUpdated := !equalHPA(cachedHPA, hpa)
 		if !ok || hpaUpdated {
 			// if the hpa has changed then remove the previous
 			// scheduled collector.
 			if hpaUpdated {
-				p.logger.Infof("Removing previously scheduled metrics collector as HPA changed: %s", resourceRef)
+				ll.Infof("Removing previously scheduled metrics collector as HPA changed: %s", resourceRef)
 				p.collectorScheduler.Remove(resourceRef)
 			}
 
 			metricConfigs, err := collector.ParseHPAMetrics(&hpa)
 			if err != nil {
-				p.logger.Errorf("Failed to parse HPA metrics: %v", err)
+				ll.Errorf("Failed to parse HPA metrics: %v", err)
 				continue
 			}
 
 			cache := true
 			for _, config := range metricConfigs {
+				cl := ll.WithFields(log.Fields{
+					"collector": config.CollectorType,
+					"name":      config.Metric.Name,
+				})
+
 				interval := config.Interval
 				if interval == 0 {
 					interval = p.collectorInterval
@@ -178,7 +189,7 @@ func (p *HPAProvider) updateHPAs() error {
 					continue
 				}
 
-				p.logger.Infof("Adding new metrics collector: %T", c)
+				cl.Infof("Adding new metrics collector: %T", c)
 				p.collectorScheduler.Add(resourceRef, config.MetricTypeName, c)
 			}
 			newHPAs++
@@ -382,6 +393,13 @@ func (t *CollectorScheduler) Add(resourceRef resourceReference, typeName collect
 // collectorRunner runs a collector at the desirec interval. If the passed
 // context is canceled the collection will be stopped.
 func collectorRunner(ctx context.Context, typeName collector.MetricTypeName, collector collector.Collector, metricsc chan<- metricCollection) {
+	log.WithFields(log.Fields{
+		"type":     typeName.Type,
+		"metric":   typeName.Metric.Name,
+		"selector": typeName.Metric.Selector.String(),
+		"interval": collector.Interval(),
+	}).Debug("starting collector")
+
 	for {
 		values, err := collector.GetMetrics(ctx)
 		if err != nil {
