@@ -2,8 +2,13 @@ package collector
 
 import (
 	"context"
+	"errors"
+	"math"
 	"testing"
+	"time"
 
+	promv1 "github.com/prometheus/client_golang/api/prometheus/v1"
+	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/require"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -189,6 +194,103 @@ func TestNewPrometheusCollector(t *testing.T) {
 			} else {
 				require.Error(t, err)
 			}
+		})
+	}
+}
+
+// fakePromAPI implements only Query; the embedded interface panics on anything
+// else, which keeps the surface of these tests small.
+type fakePromAPI struct {
+	promv1.API
+	value    model.Value
+	warnings promv1.Warnings
+	err      error
+}
+
+func (f fakePromAPI) Query(_ context.Context, _ string, _ time.Time, _ ...promv1.Option) (model.Value, promv1.Warnings, error) {
+	return f.value, f.warnings, f.err
+}
+
+func TestPrometheusCollectorGetMetrics(t *testing.T) {
+	for _, tc := range []struct {
+		msg           string
+		value         model.Value
+		warnings      promv1.Warnings
+		queryErr      error
+		expectedError error
+		expectedValue int64
+	}{
+		{
+			msg:           "single sample vector is collected",
+			value:         model.Vector{{Value: 42}},
+			expectedValue: 42,
+		},
+		{
+			msg:           "scalar is collected",
+			value:         &model.Scalar{Value: 7},
+			expectedValue: 7,
+		},
+		{
+			msg:           "warnings do not prevent collection",
+			value:         model.Vector{{Value: 3}},
+			warnings:      promv1.Warnings{"too many samples"},
+			expectedValue: 3,
+		},
+		{
+			msg:           "empty vector yields no result",
+			value:         model.Vector{},
+			expectedError: &NoResultError{query: "some_query"},
+		},
+		{
+			msg:           "multi sample vector is ambiguous",
+			value:         model.Vector{{Value: 1}, {Value: 2}},
+			expectedError: &AmbiguousResultError{query: "some_query", samples: 2},
+		},
+		{
+			msg:           "NaN scalar yields no result",
+			value:         &model.Scalar{Value: model.SampleValue(math.NaN())},
+			expectedError: &NoResultError{query: "some_query"},
+		},
+		{
+			// a subquery returns a matrix from the instant query endpoint; it
+			// must not be silently reported as 0
+			msg:           "matrix is not collected as zero",
+			value:         model.Matrix{{Values: []model.SamplePair{{Value: 5}}}},
+			expectedError: &NoResultError{query: "some_query"},
+		},
+		{
+			msg:           "string is not collected as zero",
+			value:         &model.String{Value: "foo"},
+			expectedError: &NoResultError{query: "some_query"},
+		},
+		{
+			msg:           "query error is propagated",
+			queryErr:      errors.New("prometheus unreachable"),
+			expectedError: errors.New("prometheus unreachable"),
+		},
+	} {
+		t.Run(tc.msg, func(t *testing.T) {
+			c := &PrometheusCollector{
+				promAPI:    fakePromAPI{value: tc.value, warnings: tc.warnings, err: tc.queryErr},
+				query:      "some_query",
+				metricType: autoscalingv2.ExternalMetricSourceType,
+				metric: autoscalingv2.MetricIdentifier{
+					Name:     "rps",
+					Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"type": "prometheus"}},
+				},
+				hpa: &autoscalingv2.HorizontalPodAutoscaler{},
+			}
+
+			metrics, err := c.GetMetrics(context.Background())
+			if tc.expectedError != nil {
+				require.Error(t, err)
+				require.ErrorContains(t, err, tc.expectedError.Error())
+				return
+			}
+
+			require.NoError(t, err)
+			require.Len(t, metrics, 1)
+			require.Equal(t, tc.expectedValue, metrics[0].External.Value.Value())
 		})
 	}
 }

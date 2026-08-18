@@ -1317,3 +1317,97 @@ func TestMetricsNonExpiration(t *testing.T) {
 	require.Len(t, externalMetricInfos, 1)
 
 }
+
+// TestExpiredMetricsNotServed asserts read paths honour the TTL directly, so a
+// stale metric stops being served immediately rather than lingering until the
+// next RemoveExpired run.
+func TestExpiredMetricsNotServed(t *testing.T) {
+	metricStore := NewMetricStore(func() time.Time {
+		return time.Now().UTC().Add(-1 * time.Hour)
+	})
+
+	metricStore.Insert(collector.CollectedMetric{
+		Type: autoscalingv2.MetricSourceType("Object"),
+		Custom: custom_metrics.MetricValue{
+			Metric: newMetricIdentifier("metric-per-unit", metav1.LabelSelector{}),
+			Value:  *resource.NewQuantity(0, ""),
+			DescribedObject: custom_metrics.ObjectReference{
+				Name:       "metricObject",
+				Namespace:  "default",
+				Kind:       "Deployment",
+				APIVersion: "apps/v1",
+			},
+		},
+	})
+
+	metricStore.Insert(collector.CollectedMetric{
+		Type:      autoscalingv2.MetricSourceType("External"),
+		Namespace: "default",
+		External: external_metrics.ExternalMetricValue{
+			MetricName: "metric-per-unit",
+			Value:      *resource.NewQuantity(0, ""),
+		},
+	})
+
+	info := provider.CustomMetricInfo{
+		GroupResource: schema.GroupResource{},
+		Namespaced:    true,
+		Metric:        "metric-per-unit",
+	}
+
+	// deliberately no RemoveExpired() call - the read paths must filter
+	metric := metricStore.GetMetricsByName(
+		context.Background(),
+		types.NamespacedName{Name: "metricObject", Namespace: "default"},
+		info,
+		labels.Everything(),
+	)
+	require.Nil(t, metric)
+
+	metrics := metricStore.GetMetricsBySelector(context.Background(), "default", labels.Everything(), info)
+	require.Empty(t, metrics.Items)
+
+	externalMetrics, err := metricStore.GetExternalMetric(
+		context.Background(),
+		"default",
+		labels.Everything(),
+		provider.ExternalMetricInfo{Metric: "metric-per-unit"},
+	)
+	require.NoError(t, err)
+	require.Empty(t, externalMetrics.Items)
+}
+
+// TestGetMetricsBySelectorNilSelector guards the cluster-scoped lookup against a
+// stored metric without a label selector.
+func TestGetMetricsBySelectorNilSelector(t *testing.T) {
+	metricStore := NewMetricStore(func() time.Time {
+		return time.Now().UTC().Add(15 * time.Minute)
+	})
+
+	metricStore.Insert(collector.CollectedMetric{
+		Type: autoscalingv2.MetricSourceType("Object"),
+		Custom: custom_metrics.MetricValue{
+			Metric: custom_metrics.MetricIdentifier{Name: "metric-per-unit"},
+			Value:  *resource.NewQuantity(0, ""),
+			DescribedObject: custom_metrics.ObjectReference{
+				Name:       "metricObject",
+				Kind:       "Node",
+				APIVersion: "core/v1",
+			},
+		},
+	})
+
+	require.NotPanics(t, func() {
+		metrics := metricStore.GetMetricsBySelector(
+			context.Background(),
+			"",
+			labels.Everything(),
+			provider.CustomMetricInfo{
+				GroupResource: schema.GroupResource{},
+				Namespaced:    false,
+				Metric:        "metric-per-unit",
+			},
+		)
+		require.Empty(t, metrics.Items)
+	})
+}
