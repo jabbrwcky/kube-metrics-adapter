@@ -11,6 +11,7 @@ import (
 	promv1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	promconfig "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
+	"github.com/sirupsen/logrus"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -36,7 +37,7 @@ func (r NoResultError) Error() string {
 }
 
 type PrometheusCollectorPlugin struct {
-	promAPI           promv1.API
+	promAPI            promv1.API
 	client             kubernetes.Interface
 	additionalPromAPIs map[string]promv1.API
 }
@@ -68,17 +69,32 @@ func getPrometheusAPI(prometheusServer, tokenFile string) (promv1.API, error) {
 
 func NewPrometheusCollectorPlugin(client kubernetes.Interface, prometheusServer, tokenFile string, additionalServers, additionalServerTokenFiles map[string]string) (*PrometheusCollectorPlugin, error) {
 	promAPI, err := getPrometheusAPI(prometheusServer, tokenFile)
+	log := logrus.WithFields(logrus.Fields{
+		"prometheus": prometheusServer,
+		"tokenFile":  tokenFile,
+	})
+
 	if err != nil {
-		return nil, err
+		log.Errorf("failed to register default prometheus server")
+		return nil, fmt.Errorf("failed to get prometheus API for prometheus server %s: %w", prometheusServer, err)
 	}
+	log.Info("registered default prometheus server")
 
 	additionalPromAPIs := make(map[string]promv1.API)
 
 	for alias, server := range additionalServers {
+		log := logrus.WithFields(logrus.Fields{
+			"alias":      alias,
+			"prometheus": server,
+			"tokenFile":  additionalServerTokenFiles[alias],
+		})
+
 		additionalPromAPIs[alias], err = getPrometheusAPI(server, additionalServerTokenFiles[alias])
 		if err != nil {
-			return nil, err
+			log.Error("unable to register additional server")
+			return nil, fmt.Errorf("failed to get API for prometheus server %s: %w", server, err)
 		}
+		log.Info("registered additional prometheus server")
 	}
 
 	return &PrometheusCollectorPlugin{
@@ -173,10 +189,9 @@ func NewPrometheusCollector(client kubernetes.Interface, promAPI promv1.API, add
 }
 
 func (c *PrometheusCollector) GetMetrics(ctx context.Context) ([]CollectedMetric, error) {
-	// TODO: use real context
 	value, _, err := c.promAPI.Query(ctx, c.query, time.Now().UTC())
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("promQL query failed: %w", err)
 	}
 
 	var sampleValue model.SampleValue
@@ -191,6 +206,9 @@ func (c *PrometheusCollector) GetMetrics(ctx context.Context) ([]CollectedMetric
 	case model.ValScalar:
 		scalar := value.(*model.Scalar)
 		sampleValue = scalar.Value
+	case model.ValNone, model.ValMatrix, model.ValString:
+		logrus.WithField("sampleType", value.Type()).Errorf("unsupported prometheus result type: %#v", value)
+		return nil, &NoResultError{query: c.query}
 	}
 
 	if math.IsNaN(float64(sampleValue)) {

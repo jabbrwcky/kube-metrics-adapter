@@ -69,6 +69,7 @@ func (p *PluginNotFoundError) Is(target error) bool {
 }
 
 func (c *CollectorFactory) RegisterPodsCollector(metricCollector string, plugin CollectorPlugin) error {
+	log.WithField("metricCollector", metricCollector).Debug("registering pods collector")
 	if metricCollector == "" {
 		c.podsPlugins.Any = plugin
 	} else {
@@ -79,6 +80,7 @@ func (c *CollectorFactory) RegisterPodsCollector(metricCollector string, plugin 
 }
 
 func (c *CollectorFactory) RegisterObjectCollector(kind, metricCollector string, plugin CollectorPlugin) error {
+	log.WithField("kind", kind).WithField("metricCollector", metricCollector).Debug("registering object collector")
 	if kind == "" {
 		if metricCollector == "" {
 			c.objectPlugins.Any.Any = plugin
@@ -118,30 +120,44 @@ func (c *CollectorFactory) RegisterObjectCollector(kind, metricCollector string,
 
 func (c *CollectorFactory) RegisterExternalCollector(metrics []string, plugin CollectorPlugin) {
 	for _, metric := range metrics {
+		log.WithField("metric", metric).Debug("register external plugin")
 		c.externalPlugins[metric] = plugin
 	}
 }
 
 func (c *CollectorFactory) NewCollector(ctx context.Context, hpa *autoscalingv2.HorizontalPodAutoscaler, config *MetricConfig, interval time.Duration) (Collector, error) {
+	l := log.WithFields(log.Fields{
+		"hpa":    hpa.Name,
+		"metric": config.Metric.Name,
+		"type":   config.Type,
+		"config": config.String(),
+	})
+	l.Debug("processing hpa")
 	switch config.Type {
 	case autoscalingv2.PodsMetricSourceType:
 		// first try to find a plugin by format
 		if plugin, ok := c.podsPlugins.Named[config.CollectorType]; ok {
+			l.Debug("found named pod plugin")
 			return plugin.NewCollector(ctx, hpa, config, interval)
 		}
 
 		// else try to use the default plugin if set
 		if c.podsPlugins.Any != nil {
+			l.Debug("returning default pod plugin")
 			return c.podsPlugins.Any.NewCollector(ctx, hpa, config, interval)
 		}
+		l.Debug("no default pod plugin found")
 	case autoscalingv2.ObjectMetricSourceType:
 		// first try to find a plugin by kind
 		if kinds, ok := c.objectPlugins.Named[config.ObjectReference.Kind]; ok {
+			ll := l.WithField("kind", config.ObjectReference.Kind)
 			if plugin, ok := kinds.Named[config.CollectorType]; ok {
+				ll.WithField("collectorType", config.CollectorType).Debug("found named object metric plugin")
 				return plugin.NewCollector(ctx, hpa, config, interval)
 			}
 
 			if kinds.Any != nil {
+				ll.Debug("returning default object metric plugin")
 				return kinds.Any.NewCollector(ctx, hpa, config, interval)
 			}
 			break
@@ -149,12 +165,15 @@ func (c *CollectorFactory) NewCollector(ctx context.Context, hpa *autoscalingv2.
 
 		// else try to find a default plugin for this kind
 		if plugin, ok := c.objectPlugins.Any.Named[config.CollectorType]; ok {
+			l.WithField("collectorType", config.CollectorType).Debug("returning default object metric plugin")
 			return plugin.NewCollector(ctx, hpa, config, interval)
 		}
 
 		if c.objectPlugins.Any.Any != nil {
+			l.Debug("returning default object metric plugin")
 			return c.objectPlugins.Any.Any.NewCollector(ctx, hpa, config, interval)
 		}
+		l.Debug("no default object metric plugin found")
 	case autoscalingv2.ExternalMetricSourceType:
 		// First type to get metric type from the `type` label,
 		// otherwise fall back to the legacy metric name based mapping.
@@ -170,9 +189,12 @@ func (c *CollectorFactory) NewCollector(ctx context.Context, hpa *autoscalingv2.
 			c.logger.Warnf("HPA %s/%s is using deprecated metric type identifier '%s'", hpa.Namespace, hpa.Name, config.Metric.Name)
 		}
 
+		l = l.WithField("pluginKey", pluginKey)
 		if plugin, ok := c.externalPlugins[pluginKey]; ok {
+			l.Debug("found external plugin")
 			return plugin.NewCollector(ctx, hpa, config, interval)
 		}
+		l.Debug("no external plugin found")
 	}
 
 	return nil, &PluginNotFoundError{metricTypeName: config.MetricTypeName}
@@ -295,5 +317,6 @@ func ParseHPAMetrics(hpa *autoscalingv2.HorizontalPodAutoscaler) ([]*MetricConfi
 		}
 		metricConfigs = append(metricConfigs, config)
 	}
+
 	return metricConfigs, nil
 }

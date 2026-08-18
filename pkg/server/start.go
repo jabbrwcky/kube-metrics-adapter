@@ -19,6 +19,7 @@ package server
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"net"
 	"net/http"
@@ -28,6 +29,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	rg "github.com/szuecs/routegroup-client/client/clientset/versioned"
 	"github.com/zalando-incubator/cluster-lifecycle-manager/pkg/credentials-loader/platformiam"
@@ -49,6 +51,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/component-base/logs/klogflags"
 	"k8s.io/klog"
 	"sigs.k8s.io/custom-metrics-apiserver/pkg/apiserver"
 	"sigs.k8s.io/custom-metrics-apiserver/pkg/cmd/options"
@@ -72,6 +75,7 @@ func NewCommandStartAdapterServer(stopCh <-chan struct{}) *cobra.Command {
 		ExternalRPSMetricName:             "skipper_serve_host_duration_seconds_count",
 		KubeClientQPS:                     0.0, // 0.0 will use the 5.0 default in client-go
 		KubeClientBurst:                   0,   // 0 will use the 10 default in client-go
+		LogLevel:                          logrus.InfoLevel.String(),
 	}
 
 	cmd := &cobra.Command{
@@ -159,17 +163,30 @@ func NewCommandStartAdapterServer(stopCh <-chan struct{}) *cobra.Command {
 		"maximum queries per second (QPS) to the Kubernetes API server (increase for large clusters), defaults to 5")
 	flags.IntVar(&o.KubeClientBurst, "kube-client-burst", o.KubeClientBurst, ""+
 		"maximum burst for throttle to the Kubernetes API server (increase for large clusters, defaults to 10)")
+
+	flags.StringVar(&o.LogLevel, "log-level", o.LogLevel, ""+
+		"log level of the adapter, one of: panic, fatal, error, warn, info, debug, trace")
+
+	fs := flag.NewFlagSet("", flag.ContinueOnError)
+	klogflags.Init(fs)
+	flags.AddGoFlagSet(fs)
+
 	return cmd
 }
 
 func (o AdapterServerOptions) RunCustomMetricsAdapterServer(stopCh <-chan struct{}) error {
+	logLevel, err := logrus.ParseLevel(o.LogLevel)
+	if err != nil {
+		return fmt.Errorf("invalid log level %q: %w", o.LogLevel, err)
+	}
+	logrus.SetLevel(logLevel)
+
 	go func() {
 		http.Handle("/metrics", promhttp.Handler())
 		klog.Fatal(http.ListenAndServe(o.MetricsAddress, nil))
 	}()
 
 	var clientConfig *rest.Config
-	var err error
 	if len(o.RemoteKubeConfigFile) > 0 {
 		loadingRules := &clientcmd.ClientConfigLoadingRules{ExplicitPath: o.RemoteKubeConfigFile}
 		loader := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, &clientcmd.ConfigOverrides{})
@@ -226,6 +243,8 @@ func (o AdapterServerOptions) RunCustomMetricsAdapterServer(stopCh <-chan struct
 	collectorFactory := collector.NewCollectorFactory()
 
 	if o.PrometheusServer != "" {
+		logrus.Debugf("Registering prometheus server(s)")
+
 		promPlugin, err := collector.NewPrometheusCollectorPlugin(client, o.PrometheusServer, o.PrometheusServerTokenFile, o.AdditionalPrometheusServers, o.AdditionalPrometheusServerTokenFiles)
 		if err != nil {
 			return fmt.Errorf("failed to initialize prometheus collector plugin: %v", err)
@@ -431,6 +450,7 @@ func (o AdapterServerOptions) RunCustomMetricsAdapterServer(stopCh <-chan struct
 	if err != nil {
 		return err
 	}
+
 	return server.GenericAPIServer.PrepareRun().RunWithContext(ctx)
 }
 
@@ -556,6 +576,8 @@ type AdapterServerOptions struct {
 	ExternalRPSMetricName string
 	// KubeClientQPS configures the maximum QPS to the Kubernetes API server
 	KubeClientQPS float64
+	// LogLevel configures the verbosity of the adapter's own logging
+	LogLevel string
 	// KubeClientBurst configures the maximum burst for throttle to the Kubernetes API server
 	KubeClientBurst int
 }
